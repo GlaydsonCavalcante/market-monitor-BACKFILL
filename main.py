@@ -133,10 +133,9 @@ def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: d
             tema_slug = processor.normalizar_nome_tema(tema)
             nome_arquivo = f"noticias_raw_{regiao}_{tag_mes}_{tema_slug}.json"
 
-            # 1. Trava: Verifica existência prévia do arquivo
+            # 1. Registro no inventário se o arquivo não existir
             if nome_arquivo not in mapa_drive:
-                print(f"⚠️ [IGNORADO] {nome_arquivo} não existe na pasta 'dados_brutos'.", flush=True)
-                continue
+                mapa_drive[nome_arquivo] = 0
 
             # 2. Trava de Idempotência com validação de payload útil
             tamanho = mapa_drive.get(nome_arquivo, 0)
