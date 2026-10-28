@@ -131,19 +131,28 @@ def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: d
 
         for tema, dict_idiomas in cfg.MONITORAMENTOS.items():
             tema_slug = processor.normalizar_nome_tema(tema)
-            nome_arquivo = f"noticias_raw_{tag_mes}_{tema_slug}.json"
+            nome_arquivo = f"noticias_raw_{regiao}_{tag_mes}_{tema_slug}.json"
 
             # 1. Trava: Verifica existência prévia do arquivo
             if nome_arquivo not in mapa_drive:
                 print(f"⚠️ [IGNORADO] {nome_arquivo} não existe na pasta 'dados_brutos'.", flush=True)
                 continue
 
-            # 2. Trava de Idempotência: Se o arquivo já contém dados (> 4 bytes), pula
-            tamanho = mapa_drive[nome_arquivo]
+            # 2. Trava de Idempotência com validação de payload útil
+            tamanho = mapa_drive.get(nome_arquivo, 0)
             if tamanho > 4:
-                print(f"⏭️ [PULANDO FASE A] {nome_arquivo} já possui conteúdo gravado ({tamanho} bytes).", flush=True)
-                continue
+                proc_check = subprocess.run(["rclone", "cat", f"gdrive_dados:{nome_arquivo}"], capture_output=True)
+                if proc_check.returncode == 0:
+                    try:
+                        dados_existentes = json.loads(proc_check.stdout.decode("utf-8"))
+                        if isinstance(dados_existentes, list) and len(dados_existentes) > 0:
+                            if dados_existentes[0].get("status_extracao") != "SEM_NOTICIAS_NO_PERIODO":
+                                print(f"⏭️ [PULANDO FASE A] {nome_arquivo} já possui notícias válidas ({tamanho} bytes).", flush=True)
+                                continue
+                    except Exception:
+                        pass
 
+            
             print(f">> [FASE A] Descobrindo matérias para: {nome_arquivo}...", flush=True)
             raw_artigos = []
 
@@ -227,7 +236,7 @@ def executar_fase_b_extracao(cfg, regiao: str, meses_alvo: list, mapa_drive: dic
 
         for tema, _ in cfg.MONITORAMENTOS.items():
             tema_slug = processor.normalizar_nome_tema(tema)
-            nome_arquivo = f"noticias_raw_{tag_mes}_{tema_slug}.json"
+            nome_arquivo = f"noticias_raw_{regiao}_{tag_mes}_{tema_slug}.json"
 
             if nome_arquivo not in mapa_drive:
                 continue
