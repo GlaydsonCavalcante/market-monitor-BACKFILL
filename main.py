@@ -131,7 +131,7 @@ def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: d
 
         for tema, dict_idiomas in cfg.MONITORAMENTOS.items():
             tema_slug = processor.normalizar_nome_tema(tema)
-            nome_arquivo = f"noticias_raw_{regiao}_{tag_mes}_{tema_slug}.json"
+            nome_arquivo = f"noticias_raw_{tag_mes}_{tema_slug}.json"
 
             # 1. Registro no inventário se o arquivo não existir
             if nome_arquivo not in mapa_drive:
@@ -173,7 +173,10 @@ def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: d
                             raw_artigos.append(item)
 
             if not raw_artigos:
-                print(f"   ℹ️ Nenhuma matéria encontrada em {tag_mes} para '{tema}'.", flush=True)
+                print(f"   ℹ️ Nenhuma matéria encontrada em {tag_mes} para '{tema}' neste shard.", flush=True)
+                # Se o arquivo já tem dados úteis ou já existe no Drive com conteúdo, não sobrescreve
+                if nome_arquivo in mapa_drive and mapa_drive[nome_arquivo] > 4:
+                    continue
                 conteudo_fase_a = [{
                     "status_extracao": "SEM_NOTICIAS_NO_PERIODO",
                     "tema": tema,
@@ -182,31 +185,49 @@ def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: d
                 }]
             else:
                 prefixo = f"CLUS_{tag_mes}_{tema_slug[:4].upper()}"
-                clusters = processor.cluster_articles_rapido(raw_artigos, similarity_threshold=80.0, prefixo_id=prefixo)
-                conteudo_fase_a = []
-                for c in clusters:
-                    conteudo_fase_a.append({
-                        "id_cluster": c["id_cluster"],
-                        "tema": c["tema"],
-                        "termo_origem": c["termo_origem"],
-                        "titulo": c["titulo"],
-                        "data_noticia": c["data_noticia"],
-                        "idioma": c["idioma"],
-                        "fonte_utilizada": c["fonte_principal"],
-                        "url_utilizada": c["url_primaria"],
-                        "url_primaria": c["url_primaria"],
-                        "urls_espelho": c["urls_espelho"],
-                        "urls_espelho_disponiveis": c["urls_espelho"],
-                        "urls_espelho_canonicas": [],
-                        "url_canonica_resolvida": None,
-                        "status_resolucao": "PENDENTE",
-                        "status_extracao": "PENDENTE",
-                        "texto_completo": "",
-                        "motivo_bloqueio": None,
-                        "necessita_extracao_manual": False,
-                        "historico_tentativas": [],
-                        "vetor_1024": None
-                    })
+                novos_clusters = processor.cluster_articles_rapido(raw_artigos, similarity_threshold=80.0, prefixo_id=prefixo)
+                
+                # Se o arquivo já possui registros, descarrega e combina
+                clusters_existentes = []
+                if nome_arquivo in mapa_drive and mapa_drive[nome_arquivo] > 4:
+                    proc_get = subprocess.run(["rclone", "cat", f"gdrive_dados:{nome_arquivo}"], capture_output=True)
+                    if proc_get.returncode == 0:
+                        try:
+                            dados = json.loads(proc_get.stdout.decode("utf-8"))
+                            if isinstance(dados, list) and len(dados) > 0 and dados[0].get("status_extracao") != "SEM_NOTICIAS_NO_PERIODO":
+                                clusters_existentes = dados
+                        except Exception:
+                            clusters_existentes = []
+
+                urls_mapeadas = {c["url_primaria"] for c in clusters_existentes if "url_primaria" in c}
+                conteudo_fase_a = list(clusters_existentes)
+
+                for c in novos_clusters:
+                    if c["url_primaria"] not in urls_mapeadas:
+                        c["id_cluster"] = f"{prefixo}_{len(conteudo_fase_a) + 1:04d}"
+                        conteudo_fase_a.append({
+                            "id_cluster": c["id_cluster"],
+                            "tema": c["tema"],
+                            "termo_origem": c["termo_origem"],
+                            "titulo": c["titulo"],
+                            "data_noticia": c["data_noticia"],
+                            "idioma": c["idioma"],
+                            "fonte_utilizada": c["fonte_principal"],
+                            "url_utilizada": c["url_primaria"],
+                            "url_primaria": c["url_primaria"],
+                            "urls_espelho": c["urls_espelho"],
+                            "urls_espelho_disponiveis": c["urls_espelho"],
+                            "urls_espelho_canonicas": [],
+                            "url_canonica_resolvida": None,
+                            "status_resolucao": "PENDENTE",
+                            "status_extracao": "PENDENTE",
+                            "texto_completo": "",
+                            "motivo_bloqueio": None,
+                            "necessita_extracao_manual": False,
+                            "historico_tentativas": [],
+                            "vetor_1024": None
+                        })
+                        urls_mapeadas.add(c["url_primaria"])
 
             with open(nome_arquivo, "w", encoding="utf-8") as f:
                 json.dump(conteudo_fase_a, f, ensure_ascii=False, indent=2)
@@ -215,10 +236,10 @@ def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: d
             if res.returncode == 0:
                 total_descobertos += len(conteudo_fase_a)
                 mapa_drive[nome_arquivo] = os.path.getsize(nome_arquivo)
-                print(f"   ✓ [FASE A] Gravado no Drive: {nome_arquivo} ({len(conteudo_fase_a)} registros)", flush=True)
+                print(f"   ✓ [FASE A] Atualizado no Drive: {nome_arquivo} ({len(conteudo_fase_a)} registros)", flush=True)
             else:
                 print(f"   ⚠️ Falha ao enviar {nome_arquivo}: {res.stderr}", flush=True)
-
+                
     print(f">> Fase A concluída para [{regiao.upper()}]. Total de clusters mapeados: {total_descobertos}\n", flush=True)
     return total_descobertos
 
@@ -237,7 +258,9 @@ def executar_fase_b_extracao(cfg, regiao: str, meses_alvo: list, mapa_drive: dic
             tema_slug = processor.normalizar_nome_tema(tema)
             nome_arquivo = f"noticias_raw_{regiao}_{tag_mes}_{tema_slug}.json"
 
+            # 1. Trava: Verifica existência prévia do arquivo para evitar Erro 403 de Cota
             if nome_arquivo not in mapa_drive:
+                print(f"⚠️ [IGNORADO] {nome_arquivo} não existe na pasta 'dados_brutos'.", flush=True)
                 continue
 
             tamanho = mapa_drive[nome_arquivo]
