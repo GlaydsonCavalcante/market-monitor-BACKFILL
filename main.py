@@ -256,7 +256,7 @@ def executar_fase_b_extracao(cfg, regiao: str, meses_alvo: list, mapa_drive: dic
 
         for tema, _ in cfg.MONITORAMENTOS.items():
             tema_slug = processor.normalizar_nome_tema(tema)
-            nome_arquivo = f"noticias_raw_{regiao}_{tag_mes}_{tema_slug}.json"
+            nome_arquivo = f"noticias_raw_{tag_mes}_{tema_slug}.json"
 
             # 1. Trava: Verifica existência prévia do arquivo para evitar Erro 403 de Cota
             if nome_arquivo not in mapa_drive:
