@@ -3,7 +3,7 @@ main.py
 
 Orquestrador desacoplado em duas fases com idempotência:
 - Fase A: Descoberta RSS semanal, formação de clusters e persistência de status PENDENTE.
-- Fase B: Raspagem factual resiliente em cascata (Fast HTTP + Playwright Stealth).
+- Fase B: Raspagem factual resiliente em cascata (Fast HTTP + Playwright Stealth). 
 """
 
 import os
