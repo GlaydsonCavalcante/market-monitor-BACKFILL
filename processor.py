@@ -8,8 +8,9 @@ e extração em cascata (Fast HTTP + Playwright Stealth).
 
 import asyncio
 import base64
-from datetime import datetime
 import os
+from datetime import datetime, timezone
+import email.utils
 import random
 import re
 import time
@@ -268,33 +269,110 @@ def scrape_article_text(url: str, timeout: int = 5) -> Tuple[Optional[str], str,
     return (text.strip() if text else None), "SUCESSO", resp.url
 
 
+# Substituir cluster_articles_rapido (linhas 242-280) por:
+
+REGEX_MARCOS_NUMERICOS = re.compile(
+    r"\b(?:[1-4]\s*[tTqQ]\s*\d{2,4}|[1-4][º°]?\s*tri(?:mestre)?|\d+(?:[.,]\d+)?%?)\b",
+    re.IGNORECASE,
+)
+
+
+def _limpar_titulo_rss(titulo: str) -> str:
+    """Remove o sufixo ' - Veículo' anexado pelo Google News RSS."""
+    if not titulo:
+        return ""
+    partes = titulo.rsplit(" - ", 1)
+    if len(partes) == 2 and len(partes[1].strip()) <= 45:
+        return partes[0].strip()
+    return titulo.strip()
+
+
+def _converter_data_rss(data_str: str) -> Optional[datetime]:
+    """Converte data RFC 2822 ou ISO em datetime UTC."""
+    if not data_str:
+        return None
+    texto = data_str.strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}", texto):
+        return datetime.fromisoformat(texto[:10]).replace(tzinfo=timezone.utc)
+    dt = email.utils.parsedate_to_datetime(texto)
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _sao_espelhos_literais(
+    tit_a: str,
+    dt_a: Optional[datetime],
+    nums_a: set,
+    tit_b: str,
+    dt_b: Optional[datetime],
+    nums_b: set,
+    similarity_threshold: float = 92.0,
+) -> bool:
+    """
+    Valida se dois itens RSS representam republicação literal do mesmo despacho:
+    exige janela <= 24h, identidade exata de cifras/trimestres e similaridade >= 92%.
+    """
+    if dt_a is not None and dt_b is not None:
+        if abs((dt_a - dt_b).total_seconds()) > 86400.0:
+            return False
+    if nums_a != nums_b:
+        return False
+    return fuzz.token_sort_ratio(tit_a, tit_b) >= similarity_threshold
+
+
 def cluster_articles_rapido(
     raw_articles: list,
-    similarity_threshold: float = 80.0,
+    similarity_threshold: float = 92.0,
     prefixo_id: str = "CLUS",
 ) -> list:
-    """Deduplicação de alta velocidade via Token Sort Ratio (sem modelos neurais pesados)."""
+    """
+    Consolida URLs idênticas e agrupa apenas republicações literais na janela de 24h
+    para preservação de fallback contra paywalls sem colapsar fatos distintos.
+    """
     if not raw_articles:
         return []
 
+    vistos_links = set()
+    artigos_unicos = []
+    for art in raw_articles:
+        lnk_norm = art.get("link", "").split("?")[0].strip().rstrip("/").lower()
+        if lnk_norm and lnk_norm in vistos_links:
+            continue
+        if lnk_norm:
+            vistos_links.add(lnk_norm)
+        artigos_unicos.append(art)
+
+    total = len(artigos_unicos)
+    titulos_limpos = [_limpar_titulo_rss(a.get("titulo", "")) for a in artigos_unicos]
+    datas_parsed = [_converter_data_rss(a.get("data_noticia", "")) for a in artigos_unicos]
+    marcos_num = [
+        {m.group(0).lower().replace(" ", "") for m in REGEX_MARCOS_NUMERICOS.finditer(t)}
+        for t in titulos_limpos
+    ]
+
     clusters = []
     visited = set()
-    total = len(raw_articles)
 
     for i in range(total):
         if i in visited:
             continue
-        cluster_members = [raw_articles[i]]
+        cluster_members = [artigos_unicos[i]]
         visited.add(i)
-        tit_i = raw_articles[i]["titulo"]
 
         for j in range(i + 1, total):
             if j in visited:
                 continue
-            tit_j = raw_articles[j]["titulo"]
-            sim = fuzz.token_sort_ratio(tit_i, tit_j)
-            if sim >= similarity_threshold:
-                cluster_members.append(raw_articles[j])
+            if _sao_espelhos_literais(
+                titulos_limpos[i],
+                datas_parsed[i],
+                marcos_num[i],
+                titulos_limpos[j],
+                datas_parsed[j],
+                marcos_num[j],
+                similarity_threshold=similarity_threshold,
+            ):
+                cluster_members.append(artigos_unicos[j])
                 visited.add(j)
 
         primary = cluster_members[0]
@@ -313,7 +391,6 @@ def cluster_articles_rapido(
             "idioma": primary["idioma"],
         })
     return clusters
-
 
 def process_cluster_with_fallback(cluster: dict, timeout: int = 6) -> dict:
     """
