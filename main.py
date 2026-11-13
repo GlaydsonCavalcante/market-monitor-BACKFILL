@@ -133,6 +133,11 @@ def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: d
             tema_slug = processor.normalizar_nome_tema(tema)
             nome_arquivo = f"noticias_raw_{tag_mes}_{tema_slug}.json"
 
+            # Restringe a descoberta RSS e o I/O de rede exclusivamente aos arquivos
+            # previamente alocados no inventario do Google Drive (evita HTTP 403 e retentativas)
+            if nome_arquivo not in mapa_drive:
+                continue        
+
             # 1. Registro no inventário se o arquivo não existir
             if nome_arquivo not in mapa_drive:
                 mapa_drive[nome_arquivo] = 0
