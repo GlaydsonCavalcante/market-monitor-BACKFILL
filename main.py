@@ -190,7 +190,7 @@ def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: d
                 }]
             else:
                 prefixo = f"CLUS_{tag_mes}_{tema_slug[:4].upper()}"
-                novos_clusters = processor.cluster_articles_rapido(raw_artigos, similarity_threshold=80.0, prefixo_id=prefixo)
+                novos_clusters = processor.cluster_articles_rapido(raw_artigos, similarity_threshold=92.0, prefixo_id=prefixo)
                 
                 # Se o arquivo já possui registros, descarrega e combina
                 clusters_existentes = []
