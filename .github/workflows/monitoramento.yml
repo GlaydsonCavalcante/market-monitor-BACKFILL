@@ -35,15 +35,15 @@ jobs:
       matrix:
         shard:
           - latam_fintechs
-          # - latam_plataformas
-          # - latam_tendencias
+          - latam_plataformas
+          - latam_tendencias
           - anglo_fintechs
-          # - anglo_plataformas
-          # - anglo_tendencias
+          - anglo_plataformas
+          - anglo_tendencias
           - europa
           - asia_cn_sg
           - asia_jp_kr
-          # - mea_india
+          - mea_india
 
     steps:
       - name: Baixar codigo do repositorio
@@ -122,15 +122,15 @@ jobs:
       matrix:
         shard:
           - latam_fintechs
-          # - latam_plataformas
-          # - latam_tendencias
+          - latam_plataformas
+          - latam_tendencias
           - anglo_fintechs
-          # - anglo_plataformas
-          # - anglo_tendencias
+          - anglo_plataformas
+          - anglo_tendencias
           - europa
           - asia_cn_sg
           - asia_jp_kr
-          # - mea_india
+          - mea_india
 
     steps:
       - name: Baixar codigo do repositorio
