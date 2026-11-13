@@ -53,18 +53,50 @@ def gerar_meses_entre(inicio_mmaaaa: str, fim_mmaaaa: str) -> list:
 
 
 def gerar_subjanelas_mes(ano: int, mes: int) -> list:
-    """Divide o mês em 4 subjanelas para contornar o teto de 100 itens do RSS."""
+    """Divide o mês em 4 intervalos de datas (dt_ini, dt_fim) para varredura RSS."""
     ultimo_dia = calendar.monthrange(ano, mes)[1]
     cortes = [(1, 7), (8, 14), (15, 21), (22, ultimo_dia)]
     janelas = []
     for d_ini, d_fim in cortes:
-        dt_ini = f"{ano:04d}-{mes:02d}-{d_ini:02d}"
+        dt_ini = datetime(ano, mes, d_ini)
         if d_fim == ultimo_dia:
-            dt_fim = f"{ano+1:04d}-01-01" if mes == 12 else f"{ano:04d}-{mes+1:02d}-01"
+            dt_fim = datetime(ano + 1, 1, 1) if mes == 12 else datetime(ano, mes + 1, 1)
         else:
-            dt_fim = f"{ano:04d}-{mes:02d}-{d_fim+1:02d}"
-        janelas.append(f"after:{dt_ini} before:{dt_fim}")
+            dt_fim = datetime(ano, mes, d_fim + 1)
+        janelas.append((dt_ini, dt_fim))
     return janelas
+    
+
+def _coletar_janela_adaptativa(
+    query_base: str,
+    dt_ini: datetime,
+    dt_fim: datetime,
+    hl: str,
+    gl: str,
+    timeout_req: int,
+    teto_truncamento: int = 95,
+) -> list:
+    """
+    Consulta o RSS do Google News para o intervalo [dt_ini, dt_fim).
+    Caso o retorno atinja o teto de truncamento do Google (~100 itens) e o
+    intervalo seja maior que 1 dia, bissecta o período recursivamente.
+    """
+    filtro = f"after:{dt_ini.strftime('%Y-%m-%d')} before:{dt_fim.strftime('%Y-%m-%d')}"
+    query_final = f"{query_base} {filtro}".strip()
+    itens = processor.fetch_rss_feed(query_final, hl=hl, gl=gl, timeout=timeout_req)
+
+    dias_intervalo = (dt_fim - dt_ini).days
+    if len(itens) >= teto_truncamento and dias_intervalo > 1:
+        dt_meio = dt_ini + timedelta(days=dias_intervalo // 2)
+        itens_esq = _coletar_janela_adaptativa(
+            query_base, dt_ini, dt_meio, hl, gl, timeout_req, teto_truncamento
+        )
+        itens_dir = _coletar_janela_adaptativa(
+            query_base, dt_meio, dt_fim, hl, gl, timeout_req, teto_truncamento
+        )
+        return itens_esq + itens_dir
+
+    return itens
 
 
 def carregar_modulo_config(caminho_ou_shard: str):
@@ -117,8 +149,10 @@ def carregar_mapa_inventario_drive() -> dict:
         raise RuntimeError(f"Erro ao analisar JSON de retorno do Rclone: {exc}")
 
 
-def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: dict) -> int:
-    """Executa a Fase A: busca RSS semanal e grava o esqueleto JSON com status PENDENTE."""
+def executar_fase_a_descoberta(
+    cfg, regiao: str, meses_alvo: list, mapa_drive: dict, forcar_redescoberta: bool = False
+) -> int:
+    """Executa a Fase A: busca RSS com bissecção adaptativa e grava clusters PENDENTE."""
     print(f"\n{'='*65}\nINICIANDO FASE A (DESCOBERTA RSS): [{regiao.upper()}]\n{'='*65}", flush=True)
     mercados = cfg.MERCADOS_ALVO
     timeout_req = getattr(cfg, "TIMEOUT_REQUISICAO", 6)
@@ -133,34 +167,23 @@ def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: d
             tema_slug = processor.normalizar_nome_tema(tema)
             nome_arquivo = f"noticias_raw_{tag_mes}_{tema_slug}.json"
 
-            # Restringe a descoberta RSS e o I/O de rede exclusivamente aos arquivos
-            # previamente alocados no inventario do Google Drive (evita HTTP 403 e retentativas)
             if nome_arquivo not in mapa_drive:
-                continue        
+                continue
 
-            # 1. Registro no inventário se o arquivo não existir
-            if nome_arquivo not in mapa_drive:
-                mapa_drive[nome_arquivo] = 0
-
-            # 2. Trava de Idempotência com validação de payload útil
             tamanho = mapa_drive.get(nome_arquivo, 0)
-            if tamanho > 4:
+            if tamanho > 4 and not forcar_redescoberta:
                 proc_check = subprocess.run(["rclone", "cat", f"gdrive_dados:{nome_arquivo}"], capture_output=True)
                 if proc_check.returncode == 0:
-                    try:
-                        dados_existentes = json.loads(proc_check.stdout.decode("utf-8"))
-                        if isinstance(dados_existentes, list) and len(dados_existentes) > 0:
-                            if dados_existentes[0].get("status_extracao") != "SEM_NOTICIAS_NO_PERIODO":
-                                print(f"⏭️ [PULANDO FASE A] {nome_arquivo} já possui notícias válidas ({tamanho} bytes).", flush=True)
-                                continue
-                    except Exception:
-                        pass
+                    dados_existentes = json.loads(proc_check.stdout.decode("utf-8"))
+                    if isinstance(dados_existentes, list) and len(dados_existentes) > 0:
+                        if dados_existentes[0].get("status_extracao") != "SEM_NOTICIAS_NO_PERIODO":
+                            print(f"⏭️ [PULANDO FASE A] {nome_arquivo} já possui notícias válidas ({tamanho} bytes).", flush=True)
+                            continue
 
-            
             print(f">> [FASE A] Descobrindo matérias para: {nome_arquivo}...", flush=True)
             raw_artigos = []
 
-            for filtro_janela in subjanelas:
+            for dt_ini, dt_fim in subjanelas:
                 for mercado in mercados:
                     gl, hl, lang = mercado["gl"], mercado["hl"], mercado["lang"]
                     termos = dict_idiomas.get(lang, [])
@@ -168,8 +191,14 @@ def executar_fase_a_descoberta(cfg, regiao: str, meses_alvo: list, mapa_drive: d
 
                     for termo in termos:
                         query_base = processor.build_rss_query(termo, excluidos, dominios)
-                        query_final = f"{query_base} {filtro_janela}".strip()
-                        itens = processor.fetch_rss_feed(query_final, hl=hl, gl=gl, timeout=timeout_req)
+                        itens = _coletar_janela_adaptativa(
+                            query_base=query_base,
+                            dt_ini=dt_ini,
+                            dt_fim=dt_fim,
+                            hl=hl,
+                            gl=gl,
+                            timeout_req=timeout_req,
+                        )
                         for item in itens:
                             item["tema"] = tema
                             item["termo_origem"] = termo
@@ -342,7 +371,13 @@ def executar_fase_b_extracao(cfg, regiao: str, meses_alvo: list, mapa_drive: dic
     return total_sucessos
 
 
-def executar_pipeline(caminho_ou_shard: str, inicio_mmaaaa: str = None, fim_mmaaaa: str = None, fase: str = "todas") -> None:
+def executar_pipeline(
+    caminho_ou_shard: str,
+    inicio_mmaaaa: str = None,
+    fim_mmaaaa: str = None,
+    fase: str = "todas",
+    forcar_redescoberta: bool = False,
+) -> None:
     cfg = carregar_modulo_config(caminho_ou_shard)
     regiao = getattr(cfg, "REGIAO_NOME", "GLOBAL").lower()
 
@@ -359,7 +394,9 @@ def executar_pipeline(caminho_ou_shard: str, inicio_mmaaaa: str = None, fim_mmaa
     print(f"SHARD: [{regiao.upper()}] | JANELA: {len(meses_alvo)} meses no escopo | FASE SELECIONADA: {fase.upper()}\n", flush=True)
 
     if fase in ["a", "todas"]:
-        executar_fase_a_descoberta(cfg, regiao, meses_alvo, mapa_drive)
+        executar_fase_a_descoberta(
+            cfg, regiao, meses_alvo, mapa_drive, forcar_redescoberta=forcar_redescoberta
+        )
 
     if fase in ["b", "todas"]:
         executar_fase_b_extracao(cfg, regiao, meses_alvo, mapa_drive)
@@ -372,6 +409,7 @@ if __name__ == "__main__":
     parser.add_argument("--inicio_mmaaaa", type=str, default=None, help="MMAAAA inicial (ex: 102021)")
     parser.add_argument("--fim_mmaaaa", type=str, default=None, help="MMAAAA final (ex: 092026)")
     parser.add_argument("--fase", type=str, default="todas", choices=["a", "b", "todas"], help="Fase a executar: a, b ou todas")
+    parser.add_argument("--forcar-redescoberta", action="store_true", help="Ignora trava de arquivo já populado na Fase A e mescla novas URLs")
     args = parser.parse_args()
 
     alvo = args.shard if args.shard else args.config
@@ -383,4 +421,5 @@ if __name__ == "__main__":
         inicio_mmaaaa=args.inicio_mmaaaa,
         fim_mmaaaa=args.fim_mmaaaa,
         fase=args.fase,
+        forcar_redescoberta=args.forcar_redescoberta,
     )
