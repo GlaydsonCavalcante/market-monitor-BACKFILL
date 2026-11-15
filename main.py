@@ -20,6 +20,8 @@ FUSO_BRASILIA = ZoneInfo("America/Sao_Paulo")
 import argparse
 import calendar
 import concurrent.futures
+import gc
+import glob
 from datetime import datetime, timedelta
 import importlib.util
 import json
@@ -83,7 +85,9 @@ def _coletar_janela_adaptativa(
     """
     filtro = f"after:{dt_ini.strftime('%Y-%m-%d')} before:{dt_fim.strftime('%Y-%m-%d')}"
     query_final = f"{query_base} {filtro}".strip()
-    itens = processor.fetch_rss_feed(query_final, hl=hl, gl=gl, timeout=timeout_req)
+    itens = processor.fetch_rss_feed(
+        query_final, hl=hl, gl=gl, timeout=timeout_req, dt_ini=dt_ini, dt_fim=dt_fim
+    )
 
     dias_intervalo = (dt_fim - dt_ini).days
     if len(itens) >= teto_truncamento and dias_intervalo > 1:
@@ -149,14 +153,29 @@ def carregar_mapa_inventario_drive() -> dict:
         raise RuntimeError(f"Erro ao analisar JSON de retorno do Rclone: {exc}")
 
 
+def _extrair_cluster_worker(cluster: dict) -> dict:
+    """Executa a extração HTTP de um cluster em processo isolado para proteção de heap C."""
+    time.sleep(random.uniform(0.05, 0.2))
+    return processor.process_cluster_with_fallback(cluster, timeout=6)
+
+
 def executar_fase_a_descoberta(
-    cfg, regiao: str, meses_alvo: list, mapa_drive: dict, forcar_redescoberta: bool = False
+    cfg,
+    shard_id: str,
+    meses_alvo: list,
+    mapa_drive: dict,
+    tema_filtro: str = None,
+    forcar_redescoberta: bool = False,
 ) -> int:
-    """Executa a Fase A: busca RSS com bissecção adaptativa e grava clusters PENDENTE."""
-    print(f"\n{'='*65}\nINICIANDO FASE A (DESCOBERTA RSS): [{regiao.upper()}]\n{'='*65}", flush=True)
+    """Coleta metadados RSS do shard e persiste localmente para consolidação posterior."""
+    print(f"\n{'='*65}\nINICIANDO FASE A (DESCOBERTA RSS): [{shard_id.upper()}]\n{'='*65}", flush=True)
     mercados = cfg.MERCADOS_ALVO
     timeout_req = getattr(cfg, "TIMEOUT_REQUISICAO", 6)
     dominios = getattr(cfg, "DOMINIOS_PREFERENCIAIS", [])
+    slug_filtro = processor.normalizar_nome_tema(tema_filtro) if tema_filtro else None
+
+    artigos_por_arquivo = {}
+    mapa_slug_tema = {}
     total_descobertos = 0
 
     for ano, mes in meses_alvo:
@@ -165,6 +184,10 @@ def executar_fase_a_descoberta(
 
         for tema, dict_idiomas in cfg.MONITORAMENTOS.items():
             tema_slug = processor.normalizar_nome_tema(tema)
+            if slug_filtro and tema_slug != slug_filtro:
+                continue
+
+            mapa_slug_tema[tema_slug] = tema
             nome_arquivo = f"noticias_raw_{tag_mes}_{tema_slug}.json"
 
             if nome_arquivo not in mapa_drive:
@@ -177,12 +200,9 @@ def executar_fase_a_descoberta(
                     dados_existentes = json.loads(proc_check.stdout.decode("utf-8"))
                     if isinstance(dados_existentes, list) and len(dados_existentes) > 0:
                         if dados_existentes[0].get("status_extracao") != "SEM_NOTICIAS_NO_PERIODO":
-                            print(f"⏭️ [PULANDO FASE A] {nome_arquivo} já possui notícias válidas ({tamanho} bytes).", flush=True)
                             continue
 
-            print(f">> [FASE A] Descobrindo matérias para: {nome_arquivo}...", flush=True)
             raw_artigos = []
-
             for dt_ini, dt_fim in subjanelas:
                 for mercado in mercados:
                     gl, hl, lang = mercado["gl"], mercado["hl"], mercado["lang"]
@@ -206,220 +226,280 @@ def executar_fase_a_descoberta(
                             item["idioma"] = hl
                             raw_artigos.append(item)
 
-            if not raw_artigos:
-                print(f"   ℹ️ Nenhuma matéria encontrada em {tag_mes} para '{tema}' neste shard.", flush=True)
-                # Se o arquivo já tem dados úteis ou já existe no Drive com conteúdo, não sobrescreve
-                if nome_arquivo in mapa_drive and mapa_drive[nome_arquivo] > 4:
-                    continue
-                conteudo_fase_a = [{
-                    "status_extracao": "SEM_NOTICIAS_NO_PERIODO",
-                    "tema": tema,
-                    "ano_mes": tag_mes,
-                    "timestamp": datetime.now(FUSO_BRASILIA).strftime("%Y-%m-%d %H:%M:%S")
-                }]
-            else:
-                prefixo = f"CLUS_{tag_mes}_{tema_slug[:4].upper()}"
-                novos_clusters = processor.cluster_articles_rapido(raw_artigos, similarity_threshold=92.0, prefixo_id=prefixo)
-                
-                # Se o arquivo já possui registros, descarrega e combina
-                clusters_existentes = []
-                if nome_arquivo in mapa_drive and mapa_drive[nome_arquivo] > 4:
-                    proc_get = subprocess.run(["rclone", "cat", f"gdrive_dados:{nome_arquivo}"], capture_output=True)
-                    if proc_get.returncode == 0:
-                        try:
-                            dados = json.loads(proc_get.stdout.decode("utf-8"))
-                            if isinstance(dados, list) and len(dados) > 0 and dados[0].get("status_extracao") != "SEM_NOTICIAS_NO_PERIODO":
-                                clusters_existentes = dados
-                        except Exception:
-                            clusters_existentes = []
+            if raw_artigos:
+                artigos_por_arquivo[nome_arquivo] = raw_artigos
+                total_descobertos += len(raw_artigos)
+                print(f"   + [{shard_id}] {nome_arquivo}: {len(raw_artigos)} itens brutos coletados.", flush=True)
 
-                urls_mapeadas = {c["url_primaria"] for c in clusters_existentes if "url_primaria" in c}
-                conteudo_fase_a = list(clusters_existentes)
+    arquivo_saida_shard = f"shard_raw_{shard_id}.json"
+    payload_shard = {
+        "shard": shard_id,
+        "mapa_slug_tema": mapa_slug_tema,
+        "artigos_por_arquivo": artigos_por_arquivo,
+    }
+    with open(arquivo_saida_shard, "w", encoding="utf-8") as f:
+        json.dump(payload_shard, f, ensure_ascii=False, indent=2)
 
-                for c in novos_clusters:
-                    if c["url_primaria"] not in urls_mapeadas:
-                        c["id_cluster"] = f"{prefixo}_{len(conteudo_fase_a) + 1:04d}"
-                        conteudo_fase_a.append({
-                            "id_cluster": c["id_cluster"],
-                            "tema": c["tema"],
-                            "termo_origem": c["termo_origem"],
-                            "titulo": c["titulo"],
-                            "data_noticia": c["data_noticia"],
-                            "idioma": c["idioma"],
-                            "fonte_utilizada": c["fonte_principal"],
-                            "url_utilizada": c["url_primaria"],
-                            "url_primaria": c["url_primaria"],
-                            "urls_espelho": c["urls_espelho"],
-                            "urls_espelho_disponiveis": c["urls_espelho"],
-                            "urls_espelho_canonicas": [],
-                            "url_canonica_resolvida": None,
-                            "status_resolucao": "PENDENTE",
-                            "status_extracao": "PENDENTE",
-                            "texto_completo": "",
-                            "motivo_bloqueio": None,
-                            "necessita_extracao_manual": False,
-                            "historico_tentativas": [],
-                            "vetor_1024": None
-                        })
-                        urls_mapeadas.add(c["url_primaria"])
-
-            with open(nome_arquivo, "w", encoding="utf-8") as f:
-                json.dump(conteudo_fase_a, f, ensure_ascii=False, indent=2)
-
-            res = subprocess.run(["rclone", "copyto", nome_arquivo, f"gdrive_dados:{nome_arquivo}"], capture_output=True, text=True)
-            if res.returncode == 0:
-                total_descobertos += len(conteudo_fase_a)
-                mapa_drive[nome_arquivo] = os.path.getsize(nome_arquivo)
-                print(f"   ✓ [FASE A] Atualizado no Drive: {nome_arquivo} ({len(conteudo_fase_a)} registros)", flush=True)
-            else:
-                print(f"   ⚠️ Falha ao enviar {nome_arquivo}: {res.stderr}", flush=True)
-                
-    print(f">> Fase A concluída para [{regiao.upper()}]. Total de clusters mapeados: {total_descobertos}\n", flush=True)
+    print(f">> Fase A concluída para [{shard_id.upper()}]. Total bruto capturado: {total_descobertos}\n", flush=True)
     return total_descobertos
 
 
-def executar_fase_b_extracao(cfg, regiao: str, meses_alvo: list, mapa_drive: dict) -> int:
-    """Executa a Fase B: raspagem factual link por link e atualização atômica no Drive."""
-    print(f"\n{'='*65}\nINICIANDO FASE B (RASPAGEM FACTUAL RESILIENTE): [{regiao.upper()}]\n{'='*65}", flush=True)
-    timeout_req = getattr(cfg, "TIMEOUT_REQUISICAO", 6)
-    max_workers = getattr(cfg, "MAX_WORKERS_PARALELO", 8)
-    total_sucessos = 0
-
-    for ano, mes in meses_alvo:
-        tag_mes = f"{ano:04d}_{mes:02d}"
-
-        for tema, _ in cfg.MONITORAMENTOS.items():
-            tema_slug = processor.normalizar_nome_tema(tema)
-            nome_arquivo = f"noticias_raw_{tag_mes}_{tema_slug}.json"
-
-            # 1. Trava: Verifica existência prévia do arquivo para evitar Erro 403 de Cota
-            if nome_arquivo not in mapa_drive:
-                print(f"⚠️ [IGNORADO] {nome_arquivo} não existe na pasta 'dados_brutos'.", flush=True)
-                continue
-
-            tamanho = mapa_drive[nome_arquivo]
-            if tamanho <= 4:
-                print(f"⚠️ [PULANDO FASE B] {nome_arquivo} está vazio no Drive (Fase A pendente).", flush=True)
-                continue
-
-            # Baixa o JSON atualizado do Google Drive
-            proc_cat = subprocess.run(["rclone", "cat", f"gdrive_dados:{nome_arquivo}"], capture_output=True)
-            if proc_cat.returncode != 0:
-                print(f"⚠️ Erro ao ler {nome_arquivo} do Drive: {proc_cat.stderr.decode('utf-8', errors='replace')}", flush=True)
-                continue
-
-            try:
-                clusters = json.loads(proc_cat.stdout.decode("utf-8"))
-            except Exception as exc:
-                print(f"⚠️ JSON ilegível em {nome_arquivo}: {exc}", flush=True)
-                continue
-
-            if not isinstance(clusters, list) or len(clusters) == 0:
-                continue
-
-            if clusters[0].get("status_extracao") == "SEM_NOTICIAS_NO_PERIODO":
-                print(f"⏭️ [PULANDO FASE B] {nome_arquivo} marcado como 'SEM_NOTICIAS_NO_PERIODO'.", flush=True)
-                continue
-
-            itens_pendentes = [c for c in clusters if c.get("status_extracao") in ["PENDENTE", "CONTEUDO_BLOQUEADO"]]
-            if not itens_pendentes:
-                print(f"⏭️ [PULANDO FASE B] {nome_arquivo} já se encontra 100% extraído com sucesso.", flush=True)
-                continue
-
-            print(f"\n>> [FASE B] Processando {len(itens_pendentes)} clusters pendentes em: {nome_arquivo}...", flush=True)
-
-            # Estágio 1: Fast HTTP em cascata
-            def worker(c):
-                time.sleep(random.uniform(0.05, 0.2))
-                return processor.process_cluster_with_fallback(c, timeout=timeout_req)
-
-            mapa_resolvidos = {}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futuros = {executor.submit(worker, c): c for c in itens_pendentes}
-                for f in concurrent.futures.as_completed(futuros):
-                    res_c = f.result()
-                    mapa_resolvidos[res_c["id_cluster"]] = res_c
-
-            # Estágio 2: Playwright Stealth para os que falharam no Estágio 1
-            bloqueados = [item for item in mapa_resolvidos.values() if item.get("status_extracao") != "SUCESSO"]
-            if bloqueados:
-                print(f"   Ativando Playwright Stealth para {len(bloqueados)} matérias retidas...", flush=True)
-                recuperados = processor.executar_fallback_playwright(bloqueados)
-                for rec in recuperados:
-                    mapa_resolvidos[rec["id_cluster"]] = rec
-
-            # Atualiza a coleção original preservando posições
-            for idx, c in enumerate(clusters):
-                cid = c.get("id_cluster")
-                if cid in mapa_resolvidos:
-                    clusters[idx] = mapa_resolvidos[cid]
-
-            sucessos_arquivo = sum(1 for c in clusters if c.get("status_extracao") == "SUCESSO")
-            total_sucessos += sucessos_arquivo
-            print(f"   Resultado Fase B: {sucessos_arquivo}/{len(clusters)} textos válidos em {nome_arquivo}.", flush=True)
-
-            with open(nome_arquivo, "w", encoding="utf-8") as f:
-                json.dump(clusters, f, ensure_ascii=False, indent=2)
-
-            res_copy = subprocess.run(["rclone", "copyto", nome_arquivo, f"gdrive_dados:{nome_arquivo}"], capture_output=True, text=True)
-            if res_copy.returncode == 0:
-                print(f"   ✓ [FASE B] Atualizado no Drive: {nome_arquivo}", flush=True)
-            else:
-                print(f"   ⚠️ Falha ao salvar Fase B em {nome_arquivo}: {res_copy.stderr}", flush=True)
-
-    print(f">> Fase B concluída para [{regiao.upper()}]. Total de matérias extraídas: {total_sucessos}\n", flush=True)
-    return total_sucessos
-
-
-def executar_pipeline(
-    caminho_ou_shard: str,
-    inicio_mmaaaa: str = None,
-    fim_mmaaaa: str = None,
-    fase: str = "todas",
+def executar_fase_a_consolidar(
+    meses_alvo: list,
+    tema_filtro: str = None,
     forcar_redescoberta: bool = False,
-) -> None:
-    cfg = carregar_modulo_config(caminho_ou_shard)
-    regiao = getattr(cfg, "REGIAO_NOME", "GLOBAL").lower()
-
-    print(">> Mapeando inventário unificado de arquivos no Google Drive...", flush=True)
+) -> int:
+    """Unifica os resultados de todos os shards da Fase A e grava no Google Drive sem concorrência."""
+    print(f"\n{'='*65}\nCONSOLIDANDO SHARDS DA FASE A E PERSISTINDO NO DRIVE\n{'='*65}", flush=True)
     mapa_drive = carregar_mapa_inventario_drive()
-    print(f"   Total de arquivos auditados em 'dados_brutos': {len(mapa_drive)}", flush=True)
+    slug_filtro = processor.normalizar_nome_tema(tema_filtro) if tema_filtro else None
 
-    if inicio_mmaaaa and fim_mmaaaa:
-        meses_alvo = gerar_meses_entre(inicio_mmaaaa, fim_mmaaaa)
-    else:
-        agora = datetime.now(FUSO_BRASILIA)
-        meses_alvo = [(agora.year, agora.month)]
+    arquivos_shards = sorted(glob.glob("shard_raw_*.json"))
+    if not arquivos_shards:
+        raise FileNotFoundError("Nenhum artifact 'shard_raw_*.json' localizado para consolidação.")
 
-    print(f"SHARD: [{regiao.upper()}] | JANELA: {len(meses_alvo)} meses no escopo | FASE SELECIONADA: {fase.upper()}\n", flush=True)
+    agregado_artigos = {}
+    mapa_slug_tema = {}
+    for arq_s in arquivos_shards:
+        with open(arq_s, "r", encoding="utf-8") as f:
+            dados_s = json.load(f)
+        mapa_slug_tema.update(dados_s.get("mapa_slug_tema", {}))
+        for nome_arq, lista_itens in dados_s.get("artigos_por_arquivo", {}).items():
+            agregado_artigos.setdefault(nome_arq, []).extend(lista_itens)
 
-    if fase in ["a", "todas"]:
-        executar_fase_a_descoberta(
-            cfg, regiao, meses_alvo, mapa_drive, forcar_redescoberta=forcar_redescoberta
+    tags_meses = {f"{ano:04d}_{mes:02d}" for ano, mes in meses_alvo}
+    arquivos_alvo = []
+    for nome_arq in sorted(mapa_drive.keys()):
+        m = re.match(r"^noticias_raw_(\d{4}_\d{2})_(.+)\.json$", nome_arq)
+        if not m:
+            continue
+        tag_m, slug_t = m.group(1), m.group(2)
+        if tag_m not in tags_meses:
+            continue
+        if slug_filtro and slug_t != slug_filtro:
+            continue
+        arquivos_alvo.append((nome_arq, tag_m, slug_t))
+
+    total_gravados = 0
+    for nome_arquivo, tag_mes, tema_slug in arquivos_alvo:
+        tamanho = mapa_drive.get(nome_arquivo, 0)
+        clusters_existentes = []
+
+        if tamanho > 4 and not forcar_redescoberta:
+            proc_check = subprocess.run(["rclone", "cat", f"gdrive_dados:{nome_arquivo}"], capture_output=True)
+            if proc_check.returncode == 0:
+                dados_ex = json.loads(proc_check.stdout.decode("utf-8"))
+                if isinstance(dados_ex, list) and len(dados_ex) > 0:
+                    if dados_ex[0].get("status_extracao") != "SEM_NOTICIAS_NO_PERIODO":
+                        print(f"⏭️ [MANTIDO] {nome_arquivo} já possui {len(dados_ex)} clusters válidos.", flush=True)
+                        continue
+
+        raw_combinado = agregado_artigos.get(nome_arquivo, [])
+        tema_nome = mapa_slug_tema.get(tema_slug, tema_slug)
+
+        if not raw_combinado:
+            conteudo_final = [{
+                "status_extracao": "SEM_NOTICIAS_NO_PERIODO",
+                "tema": tema_nome,
+                "ano_mes": tag_mes,
+                "timestamp": datetime.now(FUSO_BRASILIA).strftime("%Y-%m-%d %H:%M:%S"),
+            }]
+        else:
+            prefixo = f"CLUS_{tag_mes}_{tema_slug[:4].upper()}"
+            novos_clusters = processor.cluster_articles_rapido(
+                raw_combinado, similarity_threshold=92.0, prefixo_id=prefixo
+            )
+            urls_mapeadas = {c["url_primaria"] for c in clusters_existentes if "url_primaria" in c}
+            conteudo_final = list(clusters_existentes)
+
+            for c in novos_clusters:
+                if c["url_primaria"] not in urls_mapeadas:
+                    c["id_cluster"] = f"{prefixo}_{len(conteudo_final) + 1:04d}"
+                    conteudo_final.append({
+                        "id_cluster": c["id_cluster"],
+                        "tema": c["tema"],
+                        "termo_origem": c["termo_origem"],
+                        "titulo": c["titulo"],
+                        "data_noticia": c["data_noticia"],
+                        "idioma": c["idioma"],
+                        "fonte_utilizada": c["fonte_principal"],
+                        "url_utilizada": c["url_primaria"],
+                        "url_primaria": c["url_primaria"],
+                        "urls_espelho": c["urls_espelho"],
+                        "urls_espelho_disponiveis": c["urls_espelho"],
+                        "urls_espelho_canonicas": [],
+                        "url_canonica_resolvida": None,
+                        "status_resolucao": "PENDENTE",
+                        "status_extracao": "PENDENTE",
+                        "texto_completo": "",
+                        "motivo_bloqueio": None,
+                        "necessita_extracao_manual": False,
+                        "historico_tentativas": [],
+                        "vetor_1024": None,
+                    })
+                    urls_mapeadas.add(c["url_primaria"])
+
+        with open(nome_arquivo, "w", encoding="utf-8") as f:
+            json.dump(conteudo_final, f, ensure_ascii=False, indent=2)
+
+        res = subprocess.run(["rclone", "copyto", nome_arquivo, f"gdrive_dados:{nome_arquivo}"], capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Falha ao gravar {nome_arquivo} no Drive: {res.stderr}")
+
+        total_gravados += len(conteudo_final)
+        print(f"   ✓ [CONSOLIDADO] {nome_arquivo}: {len(conteudo_final)} registros gravados no Drive.", flush=True)
+
+    return total_gravados
+
+
+def executar_fase_b_extracao(
+    meses_alvo: list,
+    tema_filtro: str = None,
+    worker_index: int = 0,
+    total_workers: int = 1,
+) -> int:
+    """Executa a Fase B particionada por índice de arquivo, eliminando sobreposição entre workers."""
+    print(
+        f"\n{'='*65}\nINICIANDO FASE B (WORKER {worker_index + 1}/{total_workers})\n{'='*65}",
+        flush=True,
+    )
+    mapa_drive = carregar_mapa_inventario_drive()
+    slug_filtro = processor.normalizar_nome_tema(tema_filtro) if tema_filtro else None
+    tags_meses = {f"{ano:04d}_{mes:02d}" for ano, mes in meses_alvo}
+
+    todos_arquivos = []
+    for nome_arq in sorted(mapa_drive.keys()):
+        m = re.match(r"^noticias_raw_(\d{4}_\d{2})_(.+)\.json$", nome_arq)
+        if not m:
+            continue
+        tag_m, slug_t = m.group(1), m.group(2)
+        if tag_m not in tags_meses:
+            continue
+        if slug_filtro and slug_t != slug_filtro:
+            continue
+        todos_arquivos.append(nome_arq)
+
+    arquivos_worker = todos_arquivos[worker_index::total_workers]
+    print(f"Arquivos atribuídos a este worker: {len(arquivos_worker)} de {len(todos_arquivos)}.", flush=True)
+
+    total_clusters_lote = 0
+    total_processadas_lote = 0
+    total_sucessos_lote = 0
+
+    for nome_arquivo in arquivos_worker:
+        tamanho = mapa_drive.get(nome_arquivo, 0)
+        if tamanho <= 4:
+            continue
+
+        proc_cat = subprocess.run(["rclone", "cat", f"gdrive_dados:{nome_arquivo}"], capture_output=True)
+        if proc_cat.returncode != 0:
+            raise RuntimeError(f"Erro ao ler {nome_arquivo} do Drive: {proc_cat.stderr.decode('utf-8', errors='replace')}")
+
+        clusters = json.loads(proc_cat.stdout.decode("utf-8"))
+        if not isinstance(clusters, list) or len(clusters) == 0:
+            continue
+
+        if clusters[0].get("status_extracao") == "SEM_NOTICIAS_NO_PERIODO":
+            continue
+
+        itens_pendentes = [c for c in clusters if c.get("status_extracao") in ["PENDENTE", "CONTEUDO_BLOQUEADO"]]
+        if not itens_pendentes:
+            continue
+
+        print(f"\n>> [FASE B] Extraindo {len(itens_pendentes)} clusters em: {nome_arquivo}...", flush=True)
+        gc.collect()
+
+        mapa_resolvidos = {}
+        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+            futuros = {executor.submit(_extrair_cluster_worker, c): c for c in itens_pendentes}
+            for f in concurrent.futures.as_completed(futuros):
+                res_c = f.result()
+                mapa_resolvidos[res_c["id_cluster"]] = res_c
+
+        bloqueados = [item for item in mapa_resolvidos.values() if item.get("status_extracao") != "SUCESSO"]
+        if bloqueados:
+            print(f"   Ativando Playwright Stealth para {len(bloqueados)} matérias retidas...", flush=True)
+            recuperados = processor.executar_fallback_playwright(bloqueados)
+            for rec in recuperados:
+                mapa_resolvidos[rec["id_cluster"]] = rec
+
+        for idx, c in enumerate(clusters):
+            cid = c.get("id_cluster")
+            if cid in mapa_resolvidos:
+                clusters[idx] = mapa_resolvidos[cid]
+
+        sucessos_arquivo = sum(1 for c in clusters if c.get("status_extracao") == "SUCESSO")
+        total_clusters_lote += len(clusters)
+        total_processadas_lote += len(itens_pendentes)
+        total_sucessos_lote += sucessos_arquivo
+        print(f"   Resultado: {sucessos_arquivo}/{len(clusters)} textos válidos em {nome_arquivo}.", flush=True)
+
+        with open(nome_arquivo, "w", encoding="utf-8") as f:
+            json.dump(clusters, f, ensure_ascii=False, indent=2)
+
+        res_copy = subprocess.run(["rclone", "copyto", nome_arquivo, f"gdrive_dados:{nome_arquivo}"], capture_output=True, text=True)
+        if res_copy.returncode != 0:
+            raise RuntimeError(f"Falha ao salvar Fase B em {nome_arquivo}: {res_copy.stderr}")
+
+    if total_processadas_lote > 0 and os.getenv("TELEGRAM_BOT_TOKEN"):
+        enviar_telegram(
+            regiao_nome=f"BACKFILL WORKER {worker_index + 1}/{total_workers}",
+            arquivos=[],
+            total_brutas=total_clusters_lote,
+            total_clusters=total_clusters_lote,
+            total_processadas=total_processadas_lote,
+            sucessos=total_sucessos_lote,
+            bloqueados=total_clusters_lote - total_sucessos_lote,
         )
 
-    if fase in ["b", "todas"]:
-        executar_fase_b_extracao(cfg, regiao, meses_alvo, mapa_drive)
+    print(f">> Worker {worker_index + 1}/{total_workers} concluído. Sucessos acumulados: {total_sucessos_lote}\n", flush=True)
+    return total_sucessos_lote
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Orquestrador Multirregional Resiliente")
+    parser = argparse.ArgumentParser(description="Orquestrador Multirregional Resiliente (Backfill)")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--shard", type=str, default=None)
     parser.add_argument("--inicio_mmaaaa", type=str, default=None, help="MMAAAA inicial (ex: 102021)")
-    parser.add_argument("--fim_mmaaaa", type=str, default=None, help="MMAAAA final (ex: 092026)")
-    parser.add_argument("--fase", type=str, default="todas", choices=["a", "b", "todas"], help="Fase a executar: a, b ou todas")
-    parser.add_argument("--forcar-redescoberta", action="store_true", help="Ignora trava de arquivo já populado na Fase A e mescla novas URLs")
+    parser.add_argument("--fim_mmaaaa", type=str, default=None, help="MMAAAA final (ex: 112026)")
+    parser.add_argument("--tema", type=str, default=None, help="Filtro opcional de tema único (ex: itau)")
+    parser.add_argument("--fase", type=str, default="todas", choices=["a", "consolidar-a", "b", "todas"])
+    parser.add_argument("--forcar-redescoberta", action="store_true")
+    parser.add_argument("--worker-index", type=int, default=0)
+    parser.add_argument("--total-workers", type=int, default=1)
     args = parser.parse_args()
 
-    alvo = args.shard if args.shard else args.config
-    if not alvo:
-        raise ValueError("É obrigatório informar --shard ou --config.")
+    if args.inicio_mmaaaa and args.fim_mmaaaa:
+        meses_escopo = gerar_meses_entre(args.inicio_mmaaaa, args.fim_mmaaaa)
+    else:
+        agora = datetime.now(FUSO_BRASILIA)
+        meses_escopo = [(agora.year, agora.month)]
 
-    executar_pipeline(
-        caminho_ou_shard=alvo,
-        inicio_mmaaaa=args.inicio_mmaaaa,
-        fim_mmaaaa=args.fim_mmaaaa,
-        fase=args.fase,
-        forcar_redescoberta=args.forcar_redescoberta,
-    )
+    if args.fase == "a":
+        alvo = args.shard if args.shard else args.config
+        if not alvo:
+            raise ValueError("É obrigatório informar --shard ou --config para a Fase A.")
+        cfg = carregar_modulo_config(alvo)
+        shard_id = os.path.basename(alvo).replace("config_", "").replace(".py", "").strip().lower()
+        mapa = carregar_mapa_inventario_drive()
+        executar_fase_a_descoberta(
+            cfg=cfg,
+            shard_id=shard_id,
+            meses_alvo=meses_escopo,
+            mapa_drive=mapa,
+            tema_filtro=args.tema,
+            forcar_redescoberta=args.forcar_redescoberta,
+        )
+    elif args.fase == "consolidar-a":
+        executar_fase_a_consolidar(
+            meses_alvo=meses_escopo,
+            tema_filtro=args.tema,
+            forcar_redescoberta=args.forcar_redescoberta,
+        )
+    elif args.fase == "b":
+        executar_fase_b_extracao(
+            meses_alvo=meses_escopo,
+            tema_filtro=args.tema,
+            worker_index=args.worker_index,
+            total_workers=args.total_workers,
+        )
