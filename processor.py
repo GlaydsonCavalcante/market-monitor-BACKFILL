@@ -206,12 +206,23 @@ def build_rss_query(base_term: str, excluded_terms: list, preferred_domains: lis
     return " ".join(parts)
 
 
-def fetch_rss_feed(query: str, hl: str, gl: str, timeout: int = 6) -> list:
-    """Consulta o RSS do Google News retornando os itens estruturados."""
+def fetch_rss_feed(
+    query: str,
+    hl: str,
+    gl: str,
+    timeout: int = 6,
+    dt_ini: Optional[datetime] = None,
+    dt_fim: Optional[datetime] = None,
+) -> list:
+    """Consulta o RSS do Google News filtrando estritamente o intervalo [dt_ini, dt_fim)."""
     encoded_query = urllib.parse.quote(query)
     ceid = f"{hl.upper()}:{gl.upper()}"
     url = f"https://news.google.com/rss/search?q={encoded_query}&hl={hl}&gl={gl}&ceid={ceid}"
     headers = {"User-Agent": random.choice(USER_AGENTS)}
+
+    dt_ini_utc = dt_ini.replace(tzinfo=timezone.utc) if dt_ini and dt_ini.tzinfo is None else dt_ini
+    dt_fim_utc = dt_fim.replace(tzinfo=timezone.utc) if dt_fim and dt_fim.tzinfo is None else dt_fim
+
     try:
         response = requests.get(url, headers=headers, timeout=timeout)
         if response.status_code != 200:
@@ -219,17 +230,23 @@ def fetch_rss_feed(query: str, hl: str, gl: str, timeout: int = 6) -> list:
         root = ET.fromstring(response.content)
         feed_items = []
         for item in root.findall(".//channel/item"):
+            data_raw = (item.find("pubDate").text or "").strip() if item.find("pubDate") is not None else ""
+
+            if dt_ini_utc is not None and dt_fim_utc is not None:
+                dt_pub = _converter_data_rss(data_raw)
+                if dt_pub is None or not (dt_ini_utc <= dt_pub < dt_fim_utc):
+                    continue
+
             feed_items.append({
                 "titulo": (item.find("title").text or "").strip(),
                 "link": (item.find("link").text or "").strip(),
-                "data_noticia": (item.find("pubDate").text or "").strip(),
+                "data_noticia": data_raw,
                 "fonte": (item.find("source").text or "Google News").strip() if item.find("source") is not None else "Google News",
                 "snippet": (item.find("description").text or "").strip(),
             })
         return feed_items
-    except Exception:
+    except (requests.exceptions.RequestException, ET.ParseError):
         return []
-
 
 def scrape_article_text(url: str, timeout: int = 5) -> Tuple[Optional[str], str, str]:
     """Extrai texto via requisição direta com fallback para BeautifulSoup."""
